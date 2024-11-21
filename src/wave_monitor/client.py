@@ -81,6 +81,14 @@ class WaveMonitor:
     def autoscale(self) -> None:
         self.write(dict(_type="autoscale"))
 
+    def add_note(self, name: str, note: str):
+        if not isinstance(name, str):
+            raise TypeError("name must be a string")
+        if not isinstance(note, str):
+            raise TypeError("note must be a string")
+
+        self.write(dict(_type="add_note", name=name, note=note))
+
     def write(self, msg: dict) -> None:
         if self.sock.state() != QLocalSocket.ConnectedState:
             if not self.refresh_connect():

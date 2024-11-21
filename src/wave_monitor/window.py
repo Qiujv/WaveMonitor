@@ -48,6 +48,7 @@ class DataSource(QLocalServer):
     remove_wfm = Signal(str)
     clear = Signal()
     autoscale = Signal()
+    add_note = Signal(str, str)
     logger = logger.getChild("DataSource")
 
     def __init__(self, parent):
@@ -124,6 +125,8 @@ class DataSource(QLocalServer):
             self.clear.emit()
         elif msg["_type"] == "autoscale":
             self.autoscale.emit()
+        elif msg["_type"] == "add_note":
+            self.add_note.emit(msg["name"], msg["note"])
         elif msg["_type"] == "are_you_there":
             self.client_connection.write(b"yes")
         else:
@@ -221,6 +224,7 @@ class MonitorWindow:
         server.remove_wfm.connect(self.remove_wfm)
         server.clear.connect(self.clear)
         server.autoscale.connect(self.autoscale)
+        server.add_note.connect(self.add_note)
 
         window.show()
         self.logger.info("Ready. Right-click to show menu.")
@@ -276,6 +280,12 @@ class MonitorWindow:
             y0 = min(wfm.offset for wfm in visible_wfms) - self.wfm_separation / 2
             y1 = max(wfm.offset for wfm in visible_wfms) + self.wfm_separation / 2
             self.plot_item.setRange(xRange=(t0, t1), yRange=(y0, y1))
+
+    def add_note(self, name: str, note: str):
+        if name in self.wfms:
+            self.wfms[name].note.setHtml(note)
+        else:
+            self.logger.warning(f"Waveform {name} not found, note not added.")
 
     def refresh_plots(self):
         for i, wfm in enumerate(self.visible_wfms):
@@ -422,6 +432,7 @@ class Waveform:
         offset: float,
         plot_item: pg.PlotItem,
         list_widget: QListWidget,
+        note: str = "",
     ):
         """Add line plot to plot_item, add checkbox to list_widget."""
         lines: list[pg.PlotDataItem] = [
@@ -432,7 +443,9 @@ class Waveform:
         ]
 
         text = pg.TextItem(text=name, anchor=(1, 0.5))
+        note = pg.TextItem(text=note, anchor=(0, 0.5))
         plot_item.addItem(text)
+        plot_item.addItem(note)
         plot_item.sigXRangeChanged.connect(self.update_label_pos)
 
         list_item = QListWidgetItem(name)
@@ -449,6 +462,7 @@ class Waveform:
         self.plot_item = plot_item
         self.lines = lines
         self.text = text
+        self.note = note
         self.update_label_pos()
         self.list_item = list_item
         self.list_widget = list_widget
@@ -497,6 +511,7 @@ class Waveform:
             self.plot_item.removeItem(line)
 
         self.plot_item.removeItem(self.text)
+        self.plot_item.removeItem(self.note)
         self.plot_item.sigXRangeChanged.disconnect(self.update_label_pos)
 
         row = self.list_widget.row(self.list_item)
@@ -512,11 +527,13 @@ class Waveform:
         else:
             pos = self.t1
         self.text.setPos(pos, self.offset)
+        self.note.setPos(pos, self.offset)
 
     def set_visible(self, visible: bool):
         for line in self.lines:
             line.setVisible(visible)
         self.text.setVisible(visible)
+        self.note.setVisible(visible)
 
         # Change checkbox state without triggering handel_checkbox_change.
         self.list_widget.itemChanged.disconnect(self.handel_checkbox_change)
