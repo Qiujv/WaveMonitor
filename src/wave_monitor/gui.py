@@ -13,7 +13,9 @@ def start():
     Qt/other args are preserved for QApplication.
     """
     parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("--log", help="Set log level (DEBUG, INFO, WARNING, ERROR)", default=None)
+    parser.add_argument(
+        "--log", help="Set log level (DEBUG, INFO, WARNING, ERROR)", default=None
+    )
     args, _ = parser.parse_known_args()
 
     if args.log:

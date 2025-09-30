@@ -14,16 +14,19 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
-
+      - uses: astral-sh/setup-uv@v6
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.x"
-
-      - name: Install Hatch
-        run: pip install hatch
-
-      - name: Build package with Hatch
-        run: hatch build
+          python-version-file: "pyproject.toml"
+      - name: Build
+        run: uv build
+        
+      # - name: Smoke test (wheel)
+      #   run: uv run --isolated --no-project --with dist/*.whl tests/smoke_test.py
+      # - name: Smoke test (source distribution)
+      #   run: uv run --isolated --no-project --with dist/*.tar.gz tests/smoke_test.py
+      # - name: Publish
+      #   run: uv publish
 
       - name: Upload distributions
         uses: actions/upload-artifact@v4

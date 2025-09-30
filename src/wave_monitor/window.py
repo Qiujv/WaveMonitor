@@ -2,6 +2,7 @@
 
 import logging
 import sys
+from importlib.metadata import PackageNotFoundError, version
 from importlib.resources import files
 from multiprocessing import shared_memory
 from typing import Callable
@@ -28,9 +29,13 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .__about__ import __version__
 from .constants import CHUNK_SIZE, HEAD_LENGTH, PIPE_NAME, SHARED_MEMORY_NAME
 from .proto import decode
+
+try:
+    __version__ = version("WaveMonitor")
+except PackageNotFoundError:
+    __version__ = "unknown"
 
 about_message = (
     f"<b>Wave Monitor</b> v{__version__}<br><br>"
@@ -150,6 +155,7 @@ class DataSource(QLocalServer):
 
 class SharedServerState:
     """Server state in shared memory."""
+
     DEFAULT_WFM_INTERVAL = 0.2  # seconds
 
     def __init__(self):
@@ -534,15 +540,15 @@ class MonitorWindow(QObject):
     def _add_test_wfm(self):
         i = len(self.wfms)
         t = np.linspace(0, 1, 1_000_001)
-        i_wave = np.cos(2 * np.pi * i * t)
-        q_wave = np.sin(2 * np.pi * i * t)
+        i_wave = np.cos(2 * np.pi * i * t, dtype=np.float16)
+        q_wave = np.sin(2 * np.pi * i * t, dtype=np.float16)
         self.add_wfm(f"test_wfm_{i}", t, [i_wave, q_wave])
 
     def _add_test_wfm1(self):
         t = np.linspace(0, 1, 10_001)
         f = np.random.randint(3, 100)
-        i_wave = np.cos(2 * np.pi * f * t)
-        q_wave = np.sin(2 * np.pi * f * t)
+        i_wave = np.cos(2 * np.pi * f * t, dtype=np.float16)
+        q_wave = np.sin(2 * np.pi * f * t, dtype=np.float16)
         z_wave = np.random.rand(t.size)
         self.add_wfm("test_wfm_random", t, [i_wave, q_wave, z_wave])
 

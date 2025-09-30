@@ -213,7 +213,6 @@ class _IOWorker(threading.Thread):
     def submit_write(self, msg: dict) -> None:
         self._tasks.put(("write", {"msg": msg}))
 
-
     def submit_connect(self, timeout_ms: int) -> Future:
         fut: Future = Future()
         self._tasks.put(("connect", {"timeout_ms": timeout_ms, "future": fut}))
@@ -339,4 +338,3 @@ class _IOWorker(threading.Thread):
         self.logger.debug("msg to send (async): %r", msg)
         payload = encode(msg)
         self._write_payload(payload)
-
