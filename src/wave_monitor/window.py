@@ -10,7 +10,7 @@ from typing import Callable
 import numpy as np
 import pyqtgraph as pg
 from PySide6.QtCore import QEvent, QObject, QPoint, QPointF, Qt, Signal
-from PySide6.QtGui import QAction, QIcon, QMouseEvent, QShortcut
+from PySide6.QtGui import QAction, QIcon, QMouseEvent, QPixmap, QShortcut
 from PySide6.QtNetwork import QLocalServer
 from PySide6.QtWidgets import (
     QApplication,
@@ -239,7 +239,9 @@ class MonitorWindow(QObject):
         """Create the main window and plotting widget."""
         window = QMainWindow()
         window.setWindowTitle("Wave Monitor")
-        window.setWindowIcon(QIcon(str(files("wave_monitor") / "assets" / "icon.png")))
+        window.setWindowIcon(
+            QIcon(QPixmap(str(files("wave_monitor") / "assets" / "icon.svg")))
+        )
 
         # Shortcuts
         QShortcut("F", window).activated.connect(self.autoscale)
@@ -796,6 +798,28 @@ def config_log(default_loglevel: str = "INFO"):
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
         datefmt="%H:%M:%S",
     )
+
+def start():
+    """Console entry point.
+
+    Accepts --log=<LEVEL> and passes it to config_log. Uses parse_known_args so
+    Qt/other args are preserved for QApplication.
+    """
+    import argparse
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument(
+        "--log", help="Set log level (DEBUG, INFO, WARNING, ERROR)", default=None
+    )
+    args, _ = parser.parse_known_args()
+
+    if args.log:
+        config_log(args.log)
+    else:
+        config_log()
+
+    app = QApplication(sys.argv)
+    _ = MonitorWindow()
+    sys.exit(app.exec())
 
 
 if __name__ == "__main__":

@@ -23,7 +23,7 @@ classifiers = [
 Homepage = "https://github.com/Qiujv/WaveMonitor"
 
 [project.gui-scripts]
-start-wave-monitor = "wave_monitor.gui:start"
+start-wave-monitor = "wave_monitor.window:start"
 
 [build-system]
 requires = ["uv_build>=0.8.0,<0.9.0"]

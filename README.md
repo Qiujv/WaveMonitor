@@ -44,6 +44,3 @@ monitor.remove_wfm("wave_10")
 ## Acknowledge
 
 This project is derived from [WaveViewer](https://github.com/kahojyun/wave-viewer).
-
-The application icon was generated using OpenAI's DALL·E model and is released into the public domain (CC0).
-
