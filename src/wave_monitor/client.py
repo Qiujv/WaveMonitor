@@ -1,5 +1,6 @@
 import logging
 import multiprocessing.shared_memory as shared_memory
+import platform
 import queue
 import subprocess
 import threading
@@ -164,38 +165,46 @@ class WaveMonitor:
         except Exception:
             pass
 
-    def connect(self, timeout_ms: int = 100) -> bool:
+    def connect(self, timeout_s: float | None = 0.1) -> bool:
         """Connect to server via the background worker and return success status."""
-        fut = self._io.submit_connect(timeout_ms)
-        return bool(fut.result(timeout=max(1.0, timeout_ms / 1000 + 0.1)))
+        fut = self._io.submit_connect(timeout_s)
+        return bool(fut.result(timeout=max(1.0, timeout_s + 0.1)))
 
     def find_or_create_window(
         self,
         log_level: Literal["WARNING", "INFO", "DEBUG"] = "INFO",
-        aviod_multiple: bool = True,
         timeout_s: float = 10,
     ) -> None:
-        """Connect to existing monitor window
-        or create one in new process.
+        """Connect to existing monitor window or create one in new process.
 
         Blocks until connected to server.
         """
-        cmd = ["start-wave-monitor", f"--log={log_level}"]
-        if not self.connect(timeout_ms=100):
-            subprocess.Popen(cmd)
-        elif aviod_multiple:
-            warnings.warn("Monitor is already running, not starting a new one.")
-            return
-        else:
-            warnings.warn("Monitor is already running, starting a duplicate one.")
-            subprocess.Popen(cmd)
+        if not self.connect(timeout_s=0.1):
+            start_wave_monitor(log_level)
 
         start_time = time.time()
-        while not self.connect(timeout_ms=100):
+        while not self.connect(timeout_s=0.1):
             self.logger.debug("Waiting for server to start listening.")
             if time.time() - start_time > timeout_s:
                 raise TimeoutError("Timeout waiting for server to start listening.")
             time.sleep(0.1)
+
+
+def start_wave_monitor(log_level: Literal["WARNING", "INFO", "DEBUG"] = "INFO"):
+    system = platform.system()
+    if system == "Windows":
+        full_cmd = [
+            "cmd",
+            "/c",
+            "start",
+            "",
+            "/B",
+            "start-wave-monitor",
+            f"--log={log_level}",
+        ]
+    else:
+        full_cmd = ["start-wave-monitor", f"--log={log_level}"]
+    subprocess.Popen(full_cmd, shell=True, close_fds=True)
 
 
 class _IOWorker(threading.Thread):
