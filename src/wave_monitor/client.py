@@ -45,7 +45,9 @@ class WaveMonitor:
             try:
                 self.find_or_create_window()
             except Exception:
-                self.logger.exception("Failed to connect to server.")
+                self.logger.exception(
+                    "Failed to connect to server. Try `find_or_create_window()` or `connect()` later."
+                )
 
     @deprecated("offset will be ignored. Use add_wfm instead.")
     def add_line(self, name: str, t: np.ndarray, ys: list[np.ndarray], offset) -> None:

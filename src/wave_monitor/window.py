@@ -65,7 +65,7 @@ class DataSource(QLocalServer):
         QApplication.instance().aboutToQuit.connect(self.close)
 
         # Remove previous instance. see https://doc.qt.io/qtforpython-6/PySide6/QtNetwork/QLocalServer.html#PySide6.QtNetwork.PySide6.QtNetwork.QLocalServer.removeServer
-        # self.removeServer(PIPE_NAME)  # Remove previous instance.
+        self.removeServer(PIPE_NAME)  # Remove previous instance.
         self.listen(PIPE_NAME)
 
         self.logger.info('Listening on "%s".', self.fullServerName())
@@ -587,13 +587,6 @@ class Waveform:
         note: str = "",
     ):
         """Add line plot to plot_item, add checkbox to list_widget."""
-        lines: list[pg.PlotDataItem] = [
-            plot_item.plot(
-                t, y + offset, pen=color[:-1], fillLevel=offset, fillBrush=color
-            )
-            for y, color in zip(ys, self.colors)
-        ]
-
         text = pg.TextItem(text=name, anchor=(1, 0.5))
         note = pg.TextItem(text=note, anchor=(0, 0.5))
         plot_item.addItem(text)
@@ -607,55 +600,70 @@ class Waveform:
         # The checkbox state change is emitted by QListWidget.
         list_widget.itemChanged.connect(self.handel_checkbox_change)
         list_widget.insertItem(0, list_item)
-
-        self.offset = offset
-        self.t0 = t[0]
-        self.t1 = t[-1]
         self.plot_item = plot_item
-        self.lines = lines
+        self.lines: list[pg.PlotDataItem] = []
+        self.t = t
+        self.ys = ys
+        if self.t.size:
+            self.t0 = self.t[0]
+            self.t1 = self.t[-1]
+        else:
+            self.t0 = 0.0
+            self.t1 = 0.0
+        self.offset = offset
         self.text = text
         self.note = note
         self.update_label_pos()
         self.list_item = list_item
         self.list_widget = list_widget
 
+        self.reset_plot_data()
+
     def update_wfm(self, t: np.ndarray, ys: list[np.ndarray]):
-        # Update existing lines with new data.
-        old_lines = self.lines
-        new_lines = []
-        for line, y in zip(self.lines, ys):
-            line.setData(t, y + self.offset)
-            new_lines.append(line)
+        self.t = t
+        self.ys = ys
+        if self.t.size:
+            self.t0 = self.t[0]
+            self.t1 = self.t[-1]
+        else:
+            self.t0 = 0.0
+            self.t1 = 0.0
+        self.reset_plot_data()
 
-        # Remove unused lines.
-        if len(ys) < len(old_lines):
-            for line in old_lines[len(ys) :]:
+    def update_offset(self, offset: float):
+        self.offset = offset
+        self.reset_plot_data()
+
+    def reset_plot_data(self):
+        """Reset plot lines using stored waveform data."""
+        expected = len(self.ys)
+        current = len(self.lines)
+
+        if current > expected:
+            for line in self.lines[expected:]:
                 self.plot_item.removeItem(line)
+            self.lines = self.lines[:expected]
+            current = expected
 
-        # Add more lines if needed.
-        elif len(ys) > len(old_lines):
-            for y, color in zip(ys[len(old_lines) :], self.colors[len(old_lines) :]):
+        if current < expected:
+            for idx in range(current, expected):
+                color = self.colors[idx % len(self.colors)]
                 line = self.plot_item.plot(
-                    t,
-                    y + self.offset,
+                    self.t,
+                    self.ys[idx] + self.offset,
                     pen=color[:-1],
                     fillLevel=self.offset,
                     fillBrush=color,
                 )
-                new_lines.append(line)
+                self.lines.append(line)
 
-        self.t0 = t[0]
-        self.t1 = t[-1]
-        self.lines = new_lines
+        for idx, line in enumerate(self.lines):
+            color = self.colors[idx % len(self.colors)]
+            line.setData(self.t, self.ys[idx] + self.offset)
+            line.setPen(color[:-1])
+            line.setFillLevel(self.offset)
+            line.setFillBrush(color)
 
-    def update_offset(self, offset: float):
-        old_offset = self.offset
-        new_offset = offset
-        for line in self.lines:
-            t, y = line.getData()
-            line.setData(t, y - old_offset + new_offset)
-            line.setFillLevel(new_offset)
-        self.offset = new_offset
         self.update_label_pos()
 
     def remove(self):
