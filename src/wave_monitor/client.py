@@ -1,20 +1,18 @@
 import logging
-import multiprocessing.shared_memory as shared_memory
-import platform
+import os
 import queue
-import subprocess
 import threading
 import time
 import warnings
-from concurrent.futures import Future
-from typing import Literal
 
 import numpy as np
 from PySide6.QtNetwork import QLocalSocket
 from typing_extensions import deprecated
 
-from .constants import CHUNK_SIZE, HEAD_LENGTH, PIPE_NAME, SHARED_MEMORY_NAME
-from .proto import encode
+from .constants import PIPE_NAME
+from .ipc.launcher import can_connect_to_server, start_wave_monitor
+from .ipc.messages import write_message, write_native_message
+from .ipc.state_memory import ClientStateMemory
 
 logger = logging.getLogger(__name__)
 
@@ -39,27 +37,21 @@ class WaveMonitor:
         self._io.start()
 
         self._last_wfm_time = {}
-        self._shared_memory = None  # Will be initialized when needed
+        self._state_memory = ClientStateMemory()
 
         if create_window:
             try:
                 self.find_or_create_window()
             except Exception:
                 self.logger.exception(
-                    "Failed to connect to server. Try `find_or_create_window()` or `connect()` later."
+                    "Failed to connect to server. Try `find_or_create_window()` later."
                 )
 
     @deprecated("offset will be ignored. Use add_wfm instead.")
     def add_line(self, name: str, t: np.ndarray, ys: list[np.ndarray], offset) -> None:
         self.add_wfm(name, t, ys)
 
-    def add_wfm(
-        self,
-        name: str,
-        t: np.ndarray,
-        ys: list[np.ndarray],
-        dtype: np.float32 | None = np.float32,
-    ) -> None:
+    def add_wfm(self, name: str, t: np.ndarray, ys: list[np.ndarray]) -> None:
         if not isinstance(name, str):
             raise TypeError("name must be a string")
         if not isinstance(t, np.ndarray):
@@ -89,37 +81,23 @@ class WaveMonitor:
         self._last_wfm_time[name] = now
 
         self.logger.debug("Adding waveform '%s'", name)
-        self.write(dict(_type="add_wfm", name=name, t=t, ys=ys, _dtype=dtype))
-
-    def get_wfm_interval(self) -> float:
-        try:
-            if self._shared_memory is None:
-                self._shared_memory = shared_memory.ShareableList(
-                    name=SHARED_MEMORY_NAME
-                )
-
-            return float(self._shared_memory[0])
-        except Exception:
-            self.logger.exception(
-                "Failed to read wfm_interval from server, using fallback"
-            )
-            return 0.0
+        self._io.submit_write(dict(_type="add_wfm", name=name, t=t, ys=ys))
 
     def remove_wfm(self, name: str) -> None:
         if not isinstance(name, str):
             raise TypeError("name must be a string")
 
-        self.write(dict(_type="remove_wfm", name=name))
+        self._io.submit_write(dict(_type="remove_wfm", name=name))
 
     def clear(self) -> None:
         """Set all waveforms to zero.
 
         Note: This does not remove the waveforms, right click on the window to remove them.
         """
-        self.write(dict(_type="clear"))
+        self._io.submit_write(dict(_type="clear"))
 
     def autoscale(self) -> None:
-        self.write(dict(_type="autoscale"))
+        self._io.submit_write(dict(_type="autoscale"))
 
     def add_note(self, name: str, note: str):
         if not isinstance(name, str):
@@ -127,39 +105,25 @@ class WaveMonitor:
         if not isinstance(note, str):
             raise TypeError("note must be a string")
 
-        self.write(dict(_type="add_note", name=name, note=note))
+        self._io.submit_write(dict(_type="add_note", name=name, note=note))
 
-    def write(self, msg: dict) -> None:
-        """Asynchronously send a message via the background I/O thread.
+    def get_wfm_interval(self) -> float:
+        return self._state_memory.get_wfm_interval()
 
-        Returns immediately. Errors (like not connected) will be logged/warned
-        by the background worker.
+    def close(self, immediate: bool = False, timeout: float | None = 1.0) -> None:
+        """Wait all jobs done and close connection.
+        
+        Abort the jobs with `immediate=True`
         """
-        self._io.submit_write(msg)
-
-    def disconnect(self) -> None:
-        fut = self._io.submit_disconnect()
-        ok = fut.result(timeout=1.0)
-        if not ok:
-            raise RuntimeError("Could not disconnect from server")
-
-    def close(self, drain: bool = True, timeout: float | None = 1.0) -> None:
-        """Stop background I/O worker."""
         try:
-            self._io.stop(drain=drain)
+            self._io.stop(immediate=immediate)
         except Exception:
             pass
         try:
             self._io.join(timeout)
         except Exception:
             pass
-        # Clean up shared memory connection (don't unlink, server owns it)
-        if self._shared_memory is not None:
-            try:
-                self._shared_memory.shm.close()
-                self._shared_memory = None
-            except Exception:
-                pass
+        self._state_memory.close()
 
     def __del__(self) -> None:
         try:
@@ -167,46 +131,25 @@ class WaveMonitor:
         except Exception:
             pass
 
-    def connect(self, timeout_s: float | None = 0.1) -> bool:
-        """Connect to server via the background worker and return success status."""
-        fut = self._io.submit_connect(timeout_s)
-        return bool(fut.result(timeout=max(1.0, timeout_s + 0.1)))
-
-    def find_or_create_window(
-        self,
-        log_level: Literal["WARNING", "INFO", "DEBUG"] = "INFO",
-        timeout_s: float = 10,
-    ) -> None:
+    def find_or_create_window(self, timeout_s: float = 10) -> None:
         """Connect to existing monitor window or create one in new process.
 
         Blocks until connected to server.
         """
-        if not self.connect(timeout_s=0.1):
-            start_wave_monitor(log_level)
+        if can_connect_to_server(PIPE_NAME, 100):
+            return None
+
+        start_wave_monitor()
 
         start_time = time.time()
-        while not self.connect(timeout_s=0.1):
+        while not can_connect_to_server(PIPE_NAME, 100):
             self.logger.debug("Waiting for server to start listening.")
             if time.time() - start_time > timeout_s:
                 raise TimeoutError("Timeout waiting for server to start listening.")
             time.sleep(0.1)
 
-
-def start_wave_monitor(log_level: Literal["WARNING", "INFO", "DEBUG"] = "INFO"):
-    system = platform.system()
-    if system == "Windows":
-        full_cmd = [
-            "cmd",
-            "/c",
-            "start",
-            "",
-            "/B",
-            "start-wave-monitor",
-            f"--log={log_level}",
-        ]
-    else:
-        full_cmd = ["start-wave-monitor", f"--log={log_level}"]
-    subprocess.Popen(full_cmd, shell=True, close_fds=True)
+    def close_window(self) -> None:
+        self._io.submit_write(dict(_type="close_window"))
 
 
 class _IOWorker(threading.Thread):
@@ -222,21 +165,19 @@ class _IOWorker(threading.Thread):
 
     # Public API (thread-safe)
     def submit_write(self, msg: dict) -> None:
-        self._tasks.put(("write", {"msg": msg}))
+        self._submit("write", {"msg": msg})
 
-    def submit_connect(self, timeout_ms: int) -> Future:
-        fut: Future = Future()
-        self._tasks.put(("connect", {"timeout_ms": timeout_ms, "future": fut}))
-        return fut
+    def _submit(self, op: str, payload: dict) -> None:
+        try:
+            self._tasks.put_nowait((op, payload))
+        except queue.Full:
+            message = f"I/O queue is full; dropping message: {op}"
+            self.logger.warning(message)
+            warnings.warn(message, stacklevel=3)
 
-    def submit_disconnect(self) -> Future:
-        fut: Future = Future()
-        self._tasks.put(("disconnect", {"future": fut}))
-        return fut
-
-    def stop(self, drain: bool = True) -> None:
-        self._tasks.put(("_stop", {}))
-        if not drain:
+    def stop(self, immediate: bool = False) -> None:
+        self._submit("_stop", {})
+        if immediate:
             self._stop_event.set()
 
     # Thread run-loop
@@ -253,23 +194,17 @@ class _IOWorker(threading.Thread):
             try:
                 if op == "write":
                     self._handle_write(payload["msg"])  # fire-and-forget
-                elif op == "connect":
-                    self._handle_connect(payload["timeout_ms"], payload["future"])
-                elif op == "disconnect":
-                    self._handle_disconnect(payload["future"])
                 else:
                     self.logger.warning("Unknown op: %s", op)
-            except Exception as e:
+            except Exception:
                 self.logger.exception("IO worker op failed: %s", op)
-                fut = payload.get("future")
-                if isinstance(fut, Future) and not fut.done():
-                    fut.set_exception(e)
 
         # Cleanup
         try:
             if self._sock is not None:
                 if self._sock.state() == QLocalSocket.ConnectedState:
                     self._sock.disconnectFromServer()
+                if self._sock.state() == QLocalSocket.ClosingState:
                     self._sock.waitForDisconnected()
         except Exception:
             pass
@@ -289,63 +224,22 @@ class _IOWorker(threading.Thread):
         self._sock.connectToServer(PIPE_NAME)
         return bool(self._sock.waitForConnected(timeout_ms))
 
-    def _handle_connect(self, timeout_ms: int, fut: Future) -> None:
-        ok = self._ensure_connected(timeout_ms)
-        if not fut.done():
-            fut.set_result(bool(ok))
-
-    def _handle_disconnect(self, fut: Future) -> None:
-        if self._sock is None:
-            ok = True
-        else:
-            try:
-                self._sock.disconnectFromServer()
-                ok = True
-                if self._sock.state() == QLocalSocket.ConnectedState:
-                    ok = bool(self._sock.waitForDisconnected())
-            except Exception:
-                ok = False
-        if not fut.done():
-            fut.set_result(ok)
-
-    def _write_payload(self, payload: bytes) -> None:
-        assert self._sock is not None
-        total_length = len(payload)
-        self._sock.write(total_length.to_bytes(HEAD_LENGTH, "big"))
-        self._sock.waitForBytesWritten()
-
-        start = 0
-        while start < total_length:
-            end = min(start + CHUNK_SIZE, total_length)
-            chunk = payload[start:end]
-            written_len = self._sock.write(chunk)
-            if written_len == -1:
-                raise RuntimeError("Failed to write to socket.")
-            start += written_len
-            self.logger.debug(
-                "Wrote %d bytes, %d bytes remaining.",
-                written_len,
-                total_length - start,
-            )
 
     def _handle_write(self, msg: dict) -> None:
-        if not self._ensure_connected(timeout_ms=100):
-            warnings.warn("Not connected to server.", stacklevel=2)
-            return
+        if os.name != "nt":
+            try:
+                write_native_message(PIPE_NAME, msg)
+                return
+            except OSError:
+                warnings.warn("Not connected to server.", stacklevel=2)
+                return
 
         try:
-            if msg.get("_type") == "add_wfm":
-                _dtype = msg.pop("_dtype", None)
-                if _dtype is not None:
-                    msg["ys"] = [
-                        y.astype(_dtype) if y.dtype != _dtype else y
-                        for y in msg.get("ys")
-                    ]
-        except Exception:
-            self.logger.exception(
-                "Failed dtype conversion in I/O worker; sending original arrays."
-            )
-
-        self.logger.debug("msg to send (async): %r", msg)
-        payload = encode(msg)
-        self._write_payload(payload)
+            if not self._ensure_connected(timeout_ms=100):
+                warnings.warn("Not connected to server.", stacklevel=2)
+            write_message(self._sock, msg)
+        except RuntimeError:
+            try:
+                write_native_message(PIPE_NAME, msg)
+            except OSError:
+                warnings.warn("Not connected to server.", stacklevel=2)

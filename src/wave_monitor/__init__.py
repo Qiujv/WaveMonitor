@@ -1,5 +1,4 @@
-from . import proto
 from .client import WaveMonitor
-from .window import MonitorWindow, config_log
+from .window import MonitorWindow
 
-__all__ = ["WaveMonitor", "MonitorWindow", "config_log", "proto"]
+__all__ = ["WaveMonitor", "MonitorWindow"]

@@ -162,3 +162,5 @@ $RECYCLE.BIN/
 
 ### User defined ###
 result.json
+*.gz
+notebooks/bench/results/

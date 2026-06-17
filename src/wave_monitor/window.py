@@ -2,35 +2,37 @@
 
 import logging
 import sys
+import warnings
+from collections.abc import Callable
 from importlib.metadata import PackageNotFoundError, version
 from importlib.resources import files
-from multiprocessing import shared_memory
-from typing import Callable
 
 import numpy as np
 import pyqtgraph as pg
-from PySide6.QtCore import QEvent, QObject, QPoint, QPointF, Qt, Signal
-from PySide6.QtGui import QAction, QIcon, QMouseEvent, QPixmap, QShortcut
-from PySide6.QtNetwork import QLocalServer
+from PySide6.QtCore import QEvent, QObject, QPointF, QSettings, Qt, QTimer, Signal
+from PySide6.QtGui import QAction, QIcon, QMouseEvent, QShortcut
+from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
     QApplication,
-    QDockWidget,
-    QDoubleSpinBox,
-    QHBoxLayout,
-    QLabel,
     QListWidget,
     QListWidgetItem,
     QMainWindow,
     QMenu,
     QMessageBox,
-    QPlainTextEdit,
-    QSizePolicy,
-    QVBoxLayout,
-    QWidget,
 )
 
-from .constants import CHUNK_SIZE, HEAD_LENGTH, PIPE_NAME, SHARED_MEMORY_NAME
-from .proto import decode
+from .constants import PIPE_NAME
+from .docks import (
+    DEFAULT_LOG_DOCK_LEVEL,
+    N_VISIBLE_WFMS,
+    WFM_ORDER_CACHE_LIMIT,
+    WFM_ORDER_SETTINGS_KEY,
+    LogDock,
+    WaveformListDock,
+)
+from .ipc.launcher import can_connect_to_server
+from .ipc.messages import MessageReader
+from .ipc.state_memory import ServerStateMemory
 
 try:
     __version__ = version("WaveMonitor")
@@ -42,8 +44,9 @@ about_message = (
     "A simple GUI for monitoring waveforms.<br><br>"
     "by Jiawei Qiu"
 )
-N_VISIBLE_WFMS = 100
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("wave_monitor.window")
+package_logger = logging.getLogger("wave_monitor")
+LOG_DOCK_LEVEL_SETTINGS_KEY = "log_dock_level"
 
 
 class DataSource(QLocalServer):
@@ -54,72 +57,56 @@ class DataSource(QLocalServer):
     clear = Signal()
     autoscale = Signal()
     add_note = Signal(str, str)
+    close_window = Signal()
     logger = logger.getChild("DataSource")
 
     def __init__(self, parent):
         super().__init__(parent=parent)
-        self.frame_buffer: bytes = b""
-        self.frame_length: int | None = None
+        self._client_readers: dict[QLocalSocket, MessageReader] = {}
+        self._client_ids: dict[QLocalSocket, int] = {}
+        self._client_pollers: dict[QLocalSocket, QTimer] = {}
+        self._next_client_id = 1
+        self._closed = False
 
         self.newConnection.connect(self.handle_new_connection)
-        QApplication.instance().aboutToQuit.connect(self.close)
-
-        # Remove previous instance. see https://doc.qt.io/qtforpython-6/PySide6/QtNetwork/QLocalServer.html#PySide6.QtNetwork.PySide6.QtNetwork.QLocalServer.removeServer
-        self.removeServer(PIPE_NAME)  # Remove previous instance.
-        self.listen(PIPE_NAME)
+        self._listen()
 
         self.logger.info('Listening on "%s".', self.fullServerName())
 
     def handle_new_connection(self):
-        self.close_client_connection()  # Close previous connection.
-        self.client_connection = self.nextPendingConnection()
-        self.client_connection.readyRead.connect(self.read_frame)
-        self.client_connection.disconnected.connect(
-            lambda: self.logger.info("Client disconnected.")
-        )
-        self.logger.info("New client connected.")
+        while self.hasPendingConnections():
+            client_connection = self.nextPendingConnection()
+            client_id = self._next_client_id
+            self._next_client_id += 1
+            self._client_readers[client_connection] = MessageReader()
+            self._client_ids[client_connection] = client_id
+            client_connection.readyRead.connect(
+                lambda sock=client_connection: self.read_frame(sock)
+            )
+            client_connection.disconnected.connect(
+                lambda sock=client_connection: self.close_client_connection(sock)
+            )
+            poller = QTimer(self)
+            poller.setInterval(20)
+            poller.timeout.connect(lambda sock=client_connection: self.read_frame(sock))
+            self._client_pollers[client_connection] = poller
+            poller.start()
+            self.logger.info("Client %s connected.", client_id)
 
-    def read_frame(self):
-        while self.client_connection.bytesAvailable():
-            self.logger.debug(">>> Buffer updated")
-            if self.frame_length is None:
-                if self.client_connection.bytesAvailable() < HEAD_LENGTH:
-                    self.logger.debug("Not enough data to read frame length.")
-                    return  # Wait for next buffer update.
-                data = self.client_connection.read(HEAD_LENGTH).data()
-                try:
-                    self.frame_length = int.from_bytes(data, "big")
-                    self.logger.info("Expecting {:,} bytes.".format(self.frame_length))
-                except Exception:
-                    self.frame_length = None
-                    self.logger.exception("Failed to parse frame length: %r", data)
-                    continue  # Try again.
-
-            expected = min(self.frame_length - len(self.frame_buffer), CHUNK_SIZE)
-            available = self.client_connection.bytesAvailable()
-            if available < expected:
-                self.logger.debug(f"{expected=:,}, {available=:,}")
-                return  # Wait for next buffer update.
-
-            data = self.client_connection.read(expected).data()
-            self.logger.debug(f"Received {len(data):,} bytes.")
-            self.frame_buffer += data
-
-            if len(self.frame_buffer) < self.frame_length:
-                continue  # Proceed to read the rest.
-
-            try:
-                msg = decode(self.frame_buffer)
-            except Exception:
-                msg = None
-                self.logger.exception("Failed to parse msg: %r", self.frame_buffer)
-
-            self.frame_buffer = b""
-            self.frame_length = None
-            self.logger.info("<<< Received: %r", msg)
+    def read_frame(self, client_connection: QLocalSocket):
+        reader = self._client_readers.get(client_connection)
+        client_id = self._client_ids.get(client_connection, "?")
+        if reader is None:
+            self.logger.warning(
+                "Received data from unknown client connection %s.", client_id
+            )
+            return
+        for msg in reader.read_available(client_connection):
+            if msg is None:
+                self.logger.warning("Failed to parse client %s message.", client_id)
+                continue
+            self.logger.debug("<<< Received from client %s: %r", client_id, msg)
             self.handle_client_message(msg)
-
-            continue  # There might be more data.
 
     def handle_client_message(self, msg: dict):
         if not isinstance(msg, dict):
@@ -139,79 +126,74 @@ class DataSource(QLocalServer):
             self.autoscale.emit()
         elif msg["_type"] == "add_note":
             self.add_note.emit(msg["name"], msg["note"])
+        elif msg["_type"] == "close_window":
+            self.close_window.emit()
+        elif msg["_type"] == "_set_ipc_probe_value":
+            self.set_ipc_probe_value(msg)
         else:
-            self.logger.exception(f"Unknown message type: {msg['_type']}")
+            self.logger.warning("Unknown message type: %s", msg["_type"])
 
-    def close_client_connection(self):
-        if hasattr(self, "client_connection"):
-            self.client_connection.readyRead.disconnect(self.read_frame)
-            self.client_connection.close()  # Not working, because client not in qt event loop.
+    def set_ipc_probe_value(self, msg: dict):
+        try:
+            self.parent().state.ipc_probe_value = int(msg["value"])
+        except Exception:
+            self.logger.exception("Failed to set IPC probe value.")
+
+    def _listen(self):
+        if self.listen(PIPE_NAME):
+            return
+        if can_connect_to_server(PIPE_NAME):
+            raise RuntimeError(
+                f'Another WaveMonitor server is already listening on "{PIPE_NAME}".'
+            )
+
+        # Remove stale socket left by a crashed previous instance, then retry.
+        self.removeServer(PIPE_NAME)
+        if not self.listen(PIPE_NAME):
+            raise RuntimeError(
+                f'Failed to listen on "{PIPE_NAME}": {self.errorString()}'
+            )
+
+    def close_client_connection(self, client_connection: QLocalSocket):
+        if client_connection not in self._client_readers:
+            return
+        try:
+            client_connection.readyRead.disconnect()
+        except Exception:
+            pass
+        try:
+            client_connection.disconnected.disconnect()
+        except Exception:
+            pass
+        client_id = self._client_ids.pop(client_connection, "?")
+        self._client_readers.pop(client_connection, None)
+        poller = self._client_pollers.pop(client_connection, None)
+        if poller is not None:
+            poller.stop()
+            poller.deleteLater()
+        client_connection.close()
+        self.logger.info("Client %s disconnected.", client_id)
+
+    def close_client_connections(self):
+        for client_connection in list(self._client_readers):
+            self.close_client_connection(client_connection)
 
     def close(self):
-        self.close_client_connection()
+        if self._closed:
+            return
+        self._closed = True
+        self.close_client_connections()
         self.logger.info('Closing server "%s".', self.fullServerName())
         super().close()
-
-
-class SharedServerState:
-    """Server state in shared memory."""
-
-    DEFAULT_WFM_INTERVAL = 0.2  # seconds
-
-    def __init__(self):
-        self._shared_memory = None
-        self.create_shared_memory()
-        QApplication.instance().aboutToQuit.connect(self.cleanup_shared_memory)
-
-    def create_shared_memory(self):
-        try:
-            old_shm = shared_memory.ShareableList(name=SHARED_MEMORY_NAME)
-            self._shared_memory = old_shm
-            logger.info(f"Reused existing shared memory '{SHARED_MEMORY_NAME}'")
-        except FileNotFoundError:
-            pass  # No existing shared memory.
-
-        try:
-            self._shared_memory = shared_memory.ShareableList(
-                [self.DEFAULT_WFM_INTERVAL], name=SHARED_MEMORY_NAME
-            )
-            logger.info(f"Created shared memory '{SHARED_MEMORY_NAME}'")
-        except Exception:
-            logger.exception("Failed to create shared memory")
-
-    def cleanup_shared_memory(self):
-        if self._shared_memory is not None:
-            try:
-                self._shared_memory.shm.close()
-                self._shared_memory.shm.unlink()
-                logger.info("Cleaned up shared memory")
-            except Exception:
-                logger.exception("Error cleaning up shared memory")
-
-    @property
-    def wfm_interval(self) -> float:
-        if self._shared_memory is not None:
-            try:
-                return float(self._shared_memory[0])
-            except Exception:
-                logger.exception("Failed to read wfm_interval from shared memory")
-        return self.DEFAULT_WFM_INTERVAL
-
-    @wfm_interval.setter
-    def wfm_interval(self, value: float) -> None:
-        if self._shared_memory is not None:
-            try:
-                self._shared_memory[0] = value
-            except Exception:
-                logger.exception("Failed to write wfm_interval to shared memory")
+        self.removeServer(PIPE_NAME)
 
 
 class MonitorWindow(QObject):
     """Keep some widgets and plot waveforms with them.
 
     This class creates the main window, the dock UI for controlling
-    waveform display, and a background DataSource thread to receive
-    messages from clients.
+    waveform display, and a local socket server to receive messages
+    from clients.
     """
 
     logger = logger.getChild("MonitorWindow")
@@ -223,7 +205,11 @@ class MonitorWindow(QObject):
         # Basic state
         self.wfm_separation = wfm_separation
         self.wfms: dict[str, "Waveform"] = {}
-        self.state = SharedServerState()
+        self.state = ServerStateMemory()
+        self._settings = QSettings("WaveMonitor", "WaveMonitor")
+        self._preferred_wfm_order = self._load_wfm_order()
+        self._resources_closed = False
+        self._package_logger_level = package_logger.level
 
         # Build UI and start server thread
         self._create_main_window()
@@ -232,6 +218,7 @@ class MonitorWindow(QObject):
         self._start_server()
 
         # Finalize
+        QApplication.instance().aboutToQuit.connect(self._close_resources)
         self.window.show()
         self.logger.info("Ready. Right-click to show menu.")
 
@@ -239,9 +226,9 @@ class MonitorWindow(QObject):
         """Create the main window and plotting widget."""
         window = QMainWindow()
         window.setWindowTitle("Wave Monitor")
-        window.setWindowIcon(
-            QIcon(QPixmap(str(files("wave_monitor") / "assets" / "icon.svg")))
-        )
+        icon = QIcon(str(files("wave_monitor") / "assets" / "icon.svg"))
+        window.setWindowIcon(icon)
+        QApplication.instance().setWindowIcon(icon)
 
         # Shortcuts
         QShortcut("F", window).activated.connect(self.autoscale)
@@ -274,108 +261,69 @@ class MonitorWindow(QObject):
 
     def _create_dock(self) -> None:
         """Create the side dock containing wfms list and controls."""
-        dock_widget = QDockWidget(f"wfms⪅{N_VISIBLE_WFMS}", self.window)
-        dock_widget.setFloating(False)
-        self.window.addDockWidget(Qt.RightDockWidgetArea, dock_widget)
+        wfm_list_dock = WaveformListDock(
+            self.wfm_separation,
+            self.state.wfm_interval,
+            self.window,
+        )
+        self.window.addDockWidget(Qt.RightDockWidgetArea, wfm_list_dock)
 
-        font_metrics = dock_widget.fontMetrics()
+        font_metrics = wfm_list_dock.fontMetrics()
         initial_width = font_metrics.horizontalAdvance("X") * 15
-        self.window.resizeDocks([dock_widget], [initial_width], Qt.Horizontal)
+        self.window.resizeDocks([wfm_list_dock], [initial_width], Qt.Horizontal)
 
-        dock_layout = QVBoxLayout()
-
-        # List widget for wfms
-        list_widget = QListWidget()
-        list_widget.setDragDropMode(QListWidget.InternalMove)
-        list_widget.setSelectionMode(QListWidget.ExtendedSelection)
-        list_widget.setContextMenuPolicy(Qt.CustomContextMenu)
-        list_widget.customContextMenuRequested.connect(self.show_list_context_menu)
-        _filter = DeleteEventFilter(self.remove_wfm, list_widget)
-        list_widget.installEventFilter(_filter)
-        self._delete_event_filter = _filter
-        dock_layout.addWidget(list_widget)
-
-        # Separation input
-        input_layout = QHBoxLayout()
-        label = QLabel("sep. ")
-        label.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
-        input_layout.addWidget(label)
-        wfm_separation_input = QDoubleSpinBox()
-        wfm_separation_input.setValue(self.wfm_separation)
-        wfm_separation_input.setMinimum(0)
-        wfm_separation_input.setSingleStep(0.5)
-        wfm_separation_input.setDecimals(1)
-        wfm_separation_input.valueChanged.connect(
-            lambda value: setattr(self, "wfm_separation", value)
-        )
-        wfm_separation_input.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        input_layout.addWidget(wfm_separation_input)
-        dock_layout.addLayout(input_layout)
-
-        # wfm_interval input
-        interval_layout = QHBoxLayout()
-        interval_label = QLabel("wfm_interval (s): ")
-        interval_label.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
-        interval_layout.addWidget(interval_label)
-        wfm_interval_input = QDoubleSpinBox()
-        wfm_interval_input.setValue(self.state.wfm_interval)
-        wfm_interval_input.setMinimum(0)
-        wfm_interval_input.setSingleStep(0.1)
-        wfm_interval_input.setDecimals(1)
-        wfm_interval_input.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        interval_layout.addWidget(wfm_interval_input)
-        dock_layout.addLayout(interval_layout)
-        wfm_interval_input.valueChanged.connect(
-            lambda v: setattr(self.state, "wfm_interval", v)
+        wfm_list_dock.order_changed.connect(self._handle_list_order_changed)
+        wfm_list_dock.show_selected.connect(self.show_wfms)
+        wfm_list_dock.hide_selected.connect(self.hide_wfms)
+        wfm_list_dock.remove_selected.connect(self.remove_wfms)
+        wfm_list_dock.clear_requested.connect(self.confirm_clear)
+        wfm_list_dock.separation_changed.connect(self._set_wfm_separation)
+        wfm_list_dock.interval_changed.connect(
+            lambda value: setattr(self.state, "wfm_interval", value)
         )
 
-        dock_layout.setSpacing(1)
-        dock_layout.setContentsMargins(0, 0, 0, 0)
-        input_layout.setSpacing(1)
-        input_layout.setContentsMargins(0, 0, 0, 0)
-
-        dock_content = QWidget()
-        dock_content.setLayout(dock_layout)
-        dock_widget.setWidget(dock_content)
-
-        self.dock_widget = dock_widget
-        self.list_widget = list_widget
+        self.wfm_list_dock = wfm_list_dock
+        self.dock_widget = wfm_list_dock
+        self.list_widget = wfm_list_dock.list_widget
 
     def _create_log_dock(self) -> None:
         """Create a dock to show log messages."""
-        log_dock = QDockWidget("Log", self.window)
-        log_dock.setFloating(False)
-        log_view = QPlainTextEdit()
-        log_view.setReadOnly(True)
-        log_view.setMaximumBlockCount(1000)
-        log_content = QWidget()
-        log_layout = QVBoxLayout()
-        log_layout.setContentsMargins(0, 0, 0, 0)
-        log_layout.addWidget(log_view)
-        log_content.setLayout(log_layout)
-        log_dock.setWidget(log_content)
+        log_level = str(
+            self._settings.value(LOG_DOCK_LEVEL_SETTINGS_KEY, DEFAULT_LOG_DOCK_LEVEL)
+        )
+        log_dock = LogDock(package_logger, self.window, level=log_level)
         self.window.addDockWidget(Qt.BottomDockWidgetArea, log_dock)
-        log_dock.hide()
-        self.log_view = log_view
         self.log_dock = log_dock
-
-        try:
-            self._log_signal = LogSignal()
-            self._log_signal.log.connect(lambda s: self.log_view.appendPlainText(s))
-            handler = QtHandler(self._log_signal)
-            logger.addHandler(handler)
-        except Exception:
-            logger.exception("Failed to initialize GUI log handler")
+        self.log_view = log_dock.log_view
 
     def _start_server(self) -> None:
-        """Start the DataSource thread to receive client messages."""
+        """Start the local socket server to receive client messages."""
         server = DataSource(self)
         server.add_wfm.connect(self.add_wfm)
         server.remove_wfm.connect(self.remove_wfm)
         server.clear.connect(self.client_clear)
         server.autoscale.connect(self.autoscale)
         server.add_note.connect(self.add_note)
+        server.close_window.connect(lambda: QTimer.singleShot(0, self.window.close))
         self.server = server
+        close_filter = WindowCloseFilter(self._close_resources)
+        self.window.installEventFilter(close_filter)
+        self._window_close_filter = close_filter
+
+    def _close_resources(self):
+        if self._resources_closed:
+            return
+        self._resources_closed = True
+        if hasattr(self, "server"):
+            self.server.close()
+        self.state.close()
+        self._settings.setValue(LOG_DOCK_LEVEL_SETTINGS_KEY, self.log_dock.level)
+        self._settings.sync()
+        self.log_dock.detach_handler()
+        package_logger.setLevel(self._package_logger_level)
+
+    def _set_wfm_separation(self, value: float) -> None:
+        self.wfm_separation = value
 
     def add_wfm(self, name: str, t: np.ndarray, ys: list[np.ndarray]):
         if name in self.wfms:
@@ -383,11 +331,22 @@ class MonitorWindow(QObject):
             wfm.update_wfm(t, ys)
         else:
             visible_wfms = self.visible_wfms
+            visible = len(visible_wfms) < N_VISIBLE_WFMS
             offset = self.wfm_separation * len(visible_wfms)
-            wfm = Waveform(name, t, ys, offset, self.plot_item, self.list_widget)
-            if len(visible_wfms) >= N_VISIBLE_WFMS:
-                wfm.set_visible(False)
+            insert_index = self._insert_index_for_wfm(name)
+            wfm = Waveform(
+                name,
+                t,
+                ys,
+                offset,
+                self.plot_item,
+                self.list_widget,
+                insert_index=insert_index,
+                visible=visible,
+            )
             self.wfms[name] = wfm
+            if visible:
+                self.refresh_plots()
 
     def remove_wfm(self, name: str):
         if name in self.wfms:
@@ -395,6 +354,20 @@ class MonitorWindow(QObject):
             del self.wfms[name]
         else:
             self.logger.warning("Waveform %s not found, nothing removed.", name)
+
+    def remove_wfms(self, names: list[str]) -> None:
+        for name in names:
+            self.remove_wfm(name)
+
+    def show_wfms(self, names: list[str]) -> None:
+        for name in names:
+            self.wfms[name].set_visible(True)
+        self.refresh_plots()
+
+    def hide_wfms(self, names: list[str]) -> None:
+        for name in names:
+            self.wfms[name].set_visible(False)
+        self.refresh_plots()
 
     def clear(self):
         for name in list(self.wfms.keys()):
@@ -427,7 +400,7 @@ class MonitorWindow(QObject):
 
     def add_note(self, name: str, note: str):
         if name in self.wfms:
-            self.wfms[name].note.setHtml(note)
+            self.wfms[name].set_note(note)
         else:
             self.logger.warning("Waveform %s not found, note not added.", name)
 
@@ -448,8 +421,58 @@ class MonitorWindow(QObject):
     @property
     def list_names(self) -> list[str]:
         """Return list of item names in list_widget, should be names of wfms."""
-        list_widget = self.list_widget
-        return [list_widget.item(i).text() for i in range(list_widget.count())]
+        return self.wfm_list_dock.list_names
+
+    def _load_wfm_order(self) -> list[str]:
+        value = self._settings.value(WFM_ORDER_SETTINGS_KEY, [])
+        if isinstance(value, str):
+            names = [value]
+        elif value is None:
+            names = []
+        else:
+            names = [str(name) for name in value]
+
+        capped_names = names[:WFM_ORDER_CACHE_LIMIT]
+        if len(capped_names) != len(names):
+            self._settings.setValue(WFM_ORDER_SETTINGS_KEY, capped_names)
+            self._settings.sync()
+        return capped_names
+
+    def _save_wfm_order(self) -> None:
+        current_names = self.list_names
+        current_set = set(current_names)
+        missing_cached_names = [
+            name for name in self._preferred_wfm_order if name not in current_set
+        ]
+        self._preferred_wfm_order = (current_names + missing_cached_names)[
+            :WFM_ORDER_CACHE_LIMIT
+        ]
+        self._settings.setValue(WFM_ORDER_SETTINGS_KEY, self._preferred_wfm_order)
+        self._settings.sync()
+
+    def clear_saved_wfm_order(self) -> None:
+        self._preferred_wfm_order = []
+        self._settings.setValue(WFM_ORDER_SETTINGS_KEY, [])
+        self._settings.sync()
+
+    def _handle_list_order_changed(self) -> None:
+        self._save_wfm_order()
+        self.refresh_plots()
+
+    def _insert_index_for_wfm(self, name: str) -> int:
+        try:
+            name_order = self._preferred_wfm_order.index(name)
+        except ValueError:
+            return 0
+
+        order_index = {
+            cached_name: i for i, cached_name in enumerate(self._preferred_wfm_order)
+        }
+        for row, existing_name in enumerate(self.list_names):
+            existing_order = order_index.get(existing_name)
+            if existing_order is not None and existing_order > name_order:
+                return row
+        return self.list_widget.count()
 
     def restore_dock(self):
         if not self.dock_widget.isVisible():
@@ -490,48 +513,21 @@ class MonitorWindow(QObject):
 
         menu.exec(self.plot_widget.mapToGlobal(pos.toPoint()))
 
-    def show_list_context_menu(self, pos: QPoint):
-        menu = QMenu(self.list_widget)
-
-        show_action = QAction("Show selected", self.dock_widget)
-
-        def show_selected_wfms():
-            for item in self.list_widget.selectedItems():
-                self.wfms[item.text()].set_visible(True)
-
-        show_action.triggered.connect(show_selected_wfms)
-        menu.addAction(show_action)
-
-        hide_action = QAction("Hide selected", self.dock_widget)
-
-        def hide_selected_wfms():
-            for item in self.list_widget.selectedItems():
-                self.wfms[item.text()].set_visible(False)
-
-        hide_action.triggered.connect(hide_selected_wfms)
-        menu.addAction(hide_action)
-
-        remove_action = QAction("Remove selected (Del)", self.dock_widget)
-
-        def remove_selected_wfms():
-            for item in self.list_widget.selectedItems():
-                self.remove_wfm(item.text())
-
-        remove_action.triggered.connect(remove_selected_wfms)
-        menu.addAction(remove_action)
-
-        clear_action = QAction("Clear all (C)", self.window)
-        clear_action.triggered.connect(self.confirm_clear)
-        menu.addAction(clear_action)
-
-        sort_action = QAction("Sort list", self.window)
-        sort_action.triggered.connect(self.list_widget.sortItems)
-        menu.addAction(sort_action)
-
-        menu.exec(self.list_widget.mapToGlobal(pos))
-
     def show_about_dialog(self):
-        QMessageBox.about(self.window, "About Wave Monitor", about_message)
+        message = QMessageBox(self.window)
+        message.setWindowTitle("About Wave Monitor")
+        message.setText(about_message)
+        message.setInformativeText(
+            f"Cached waveform order names: {len(self._preferred_wfm_order):,} "
+            f"/ {WFM_ORDER_CACHE_LIMIT:,}"
+        )
+        message.setStandardButtons(QMessageBox.Ok)
+        clear_button = message.addButton(
+            "Clear saved waveform order", QMessageBox.ActionRole
+        )
+        message.exec()
+        if message.clickedButton() is clear_button:
+            self.clear_saved_wfm_order()
 
     @staticmethod
     def setup_app_style(app: QApplication) -> None:
@@ -585,21 +581,18 @@ class Waveform:
         plot_item: pg.PlotItem,
         list_widget: QListWidget,
         note: str = "",
+        insert_index: int = 0,
+        visible: bool = True,
     ):
-        """Add line plot to plot_item, add checkbox to list_widget."""
-        text = pg.TextItem(text=name, anchor=(1, 0.5))
-        note = pg.TextItem(text=note, anchor=(0, 0.5))
-        plot_item.addItem(text)
-        plot_item.addItem(note)
-        plot_item.sigXRangeChanged.connect(self.update_label_pos)
-
+        """Store waveform data and create plot items lazily when visible."""
         list_item = QListWidgetItem(name)
         list_item.setFlags(list_item.flags() | Qt.ItemIsUserCheckable)  # Add checkbox.
-        list_item.setCheckState(Qt.Checked)
+        list_item.setCheckState(Qt.Checked if visible else Qt.Unchecked)
         # QListWidgetItem is not a QObject, so it can't emit signals.
         # The checkbox state change is emitted by QListWidget.
         list_widget.itemChanged.connect(self.handel_checkbox_change)
-        list_widget.insertItem(0, list_item)
+        list_widget.insertItem(insert_index, list_item)
+        self.name = name
         self.plot_item = plot_item
         self.lines: list[pg.PlotDataItem] = []
         self.t = t
@@ -611,13 +604,16 @@ class Waveform:
             self.t0 = 0.0
             self.t1 = 0.0
         self.offset = offset
-        self.text = text
-        self.note = note
-        self.update_label_pos()
+        self.note_text = note
+        self.text: pg.TextItem | None = None
+        self.note: pg.TextItem | None = None
+        self._plot_items_connected = False
         self.list_item = list_item
         self.list_widget = list_widget
 
-        self.reset_plot_data()
+        if visible:
+            self.ensure_plot_items()
+            self.reset_plot_data()
 
     def update_wfm(self, t: np.ndarray, ys: list[np.ndarray]):
         self.t = t
@@ -628,14 +624,30 @@ class Waveform:
         else:
             self.t0 = 0.0
             self.t1 = 0.0
-        self.reset_plot_data()
+        if self.is_visible():
+            self.reset_plot_data()
 
     def update_offset(self, offset: float):
         self.offset = offset
-        self.reset_plot_data()
+        if self.is_visible():
+            self.update_line_offsets()
+            self.update_label_pos()
+
+    def ensure_plot_items(self):
+        if self.text is not None and self.note is not None:
+            return
+        self.text = pg.TextItem(text=self.name, anchor=(1, 0.5))
+        self.note = pg.TextItem(text=self.note_text, anchor=(0, 0.5))
+        self.plot_item.addItem(self.text)
+        self.plot_item.addItem(self.note)
+        if not self._plot_items_connected:
+            self.plot_item.sigXRangeChanged.connect(self.update_label_pos)
+            self._plot_items_connected = True
+        self.update_label_pos()
 
     def reset_plot_data(self):
         """Reset plot lines using stored waveform data."""
+        self.ensure_plot_items()
         expected = len(self.ys)
         current = len(self.lines)
 
@@ -650,34 +662,57 @@ class Waveform:
                 color = self.colors[idx % len(self.colors)]
                 line = self.plot_item.plot(
                     self.t,
-                    self.ys[idx] + self.offset,
+                    self.ys[idx],
                     pen=color[:-1],
-                    fillLevel=self.offset,
+                    fillLevel=0,
                     fillBrush=color,
                 )
+                line.setPos(0, self.offset)
                 self.lines.append(line)
 
         for idx, line in enumerate(self.lines):
             color = self.colors[idx % len(self.colors)]
-            line.setData(self.t, self.ys[idx] + self.offset)
+            line.setData(self.t, self.ys[idx])
+            line.setPos(0, self.offset)
             line.setPen(color[:-1])
-            line.setFillLevel(self.offset)
+            line.setFillLevel(0)
             line.setFillBrush(color)
 
         self.update_label_pos()
 
+    def update_line_offsets(self):
+        for line in self.lines:
+            line.setPos(0, self.offset)
+
+    def set_note(self, note: str):
+        self.note_text = note
+        if self.note is not None:
+            self.note.setHtml(note)
+
     def remove(self):
         for line in self.lines:
             self.plot_item.removeItem(line)
+        self.lines.clear()
 
-        self.plot_item.removeItem(self.text)
-        self.plot_item.removeItem(self.note)
-        self.plot_item.sigXRangeChanged.disconnect(self.update_label_pos)
+        if self.text is not None:
+            self.plot_item.removeItem(self.text)
+            self.text = None
+        if self.note is not None:
+            self.plot_item.removeItem(self.note)
+            self.note = None
+        if self._plot_items_connected:
+            try:
+                self.plot_item.sigXRangeChanged.disconnect(self.update_label_pos)
+            except Exception:
+                pass
+            self._plot_items_connected = False
 
         row = self.list_widget.row(self.list_item)
         self.list_widget.takeItem(row)
 
     def update_label_pos(self):
+        if self.text is None or self.note is None:
+            return
         viewbox = self.plot_item.getViewBox()
         (x0, x1), (y0, y1) = viewbox.viewRange()
         if x1 <= self.t0:
@@ -690,15 +725,25 @@ class Waveform:
         self.note.setPos(x, self.offset)
 
     def set_visible(self, visible: bool):
+        if visible:
+            self.ensure_plot_items()
+            self.reset_plot_data()
         for line in self.lines:
             line.setVisible(visible)
-        self.text.setVisible(visible)
-        self.note.setVisible(visible)
+        if self.text is not None:
+            self.text.setVisible(visible)
+        if self.note is not None:
+            self.note.setVisible(visible)
 
         # Change checkbox state without triggering handel_checkbox_change.
-        self.list_widget.itemChanged.disconnect(self.handel_checkbox_change)
-        self.list_item.setCheckState(Qt.Checked if visible else Qt.Unchecked)
-        self.list_widget.itemChanged.connect(self.handel_checkbox_change)
+        try:
+            self.list_widget.itemChanged.disconnect(self.handel_checkbox_change)
+        except Exception:
+            pass
+        try:
+            self.list_item.setCheckState(Qt.Checked if visible else Qt.Unchecked)
+        finally:
+            self.list_widget.itemChanged.connect(self.handel_checkbox_change)
 
     def handel_checkbox_change(self, item: QListWidgetItem):
         """Triggered when the checkbox is clicked."""
@@ -706,33 +751,7 @@ class Waveform:
             self.set_visible(item.checkState() == Qt.Checked)
 
     def is_visible(self) -> bool:
-        return self.text.isVisible()
-
-
-class LogSignal(QObject):
-    """A small QObject to carry log messages to the GUI thread."""
-
-    log = Signal(str)
-
-
-class QtHandler(logging.Handler):
-    """A logging.Handler that emits records through a LogSignal."""
-
-    def __init__(self, signal: LogSignal):
-        super().__init__()
-        self._signal = signal
-        self.setFormatter(
-            logging.Formatter(
-                "%(asctime)s %(levelname)s %(name)s %(message)s", "%H:%M:%S"
-            )
-        )
-
-    def emit(self, record: logging.LogRecord) -> None:
-        try:
-            msg = self.format(record)
-            self._signal.log.emit(msg)
-        except Exception:
-            self.handleError(record)
+        return self.list_item.checkState() == Qt.Checked
 
 
 class RightClickFilter(QObject):
@@ -754,76 +773,29 @@ class RightClickFilter(QObject):
         return super().eventFilter(watched, event)
 
 
-class DeleteEventFilter(QObject):
-    def __init__(self, remove_wfm: Callable[[str], None], list_widget: QListWidget):
-        super().__init__()
-        self.remove_wfm = remove_wfm
-        self.list_widget = list_widget
-
-    def eventFilter(self, source, event):
-        if (
-            source is self.list_widget
-            and event.type() == QEvent.KeyPress
-            and event.key() == Qt.Key_Delete
-        ):
-            for item in self.list_widget.selectedItems():
-                self.remove_wfm(item.text())
-            return True
-        return super().eventFilter(source, event)
-
-
 class WindowCloseFilter(QObject):
-    """Event filter to detect window close and stop the DataSource server."""
+    """Event filter to detect window close and run cleanup."""
 
-    def __init__(self, server: DataSource):
+    def __init__(self, close_resources: Callable[[], None]):
         super().__init__()
-        self._server = server
+        self._close_resources = close_resources
 
     def eventFilter(self, watched, event):
         if event.type() == QEvent.Close:
             try:
-                # Stop the server thread cleanly when the window is closed.
-                self._server.close()
+                self._close_resources()
             except Exception:
-                logger.exception("Error while stopping DataSource on window close")
+                logger.exception("Error while closing resources on window close")
         return super().eventFilter(watched, event)
 
 
-def config_log(default_loglevel: str = "INFO"):
-    # Show all numpy array when printing.
-    np.set_printoptions(precision=2, threshold=4, edgeitems=1, linewidth=500)
-
-    # Get the log level from command line arguments, find pattern like "--log=DEBUG"
-    loglevel = next(
-        (arg.split("=")[1] for arg in sys.argv if arg.startswith("--log=")),
-        default_loglevel,
-    )
-    numeric_level = getattr(logging, loglevel.upper(), None)
-    if not isinstance(numeric_level, int):
-        raise ValueError("Invalid log level: %s" % loglevel)
-    logging.basicConfig(
-        level=numeric_level,
-        format="%(asctime)s %(levelname)s %(name)s %(message)s",
-        datefmt="%H:%M:%S",
-    )
-
 def start():
-    """Console entry point.
-
-    Accepts --log=<LEVEL> and passes it to config_log. Uses parse_known_args so
-    Qt/other args are preserved for QApplication.
-    """
-    import argparse
-    parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument(
-        "--log", help="Set log level (DEBUG, INFO, WARNING, ERROR)", default=None
-    )
-    args, _ = parser.parse_known_args()
-
-    if args.log:
-        config_log(args.log)
-    else:
-        config_log()
+    """Console entry point."""
+    if can_connect_to_server(PIPE_NAME):
+        warnings.warn(
+            f'Another WaveMonitor server is already listening on "{PIPE_NAME}".'
+        )
+        return
 
     app = QApplication(sys.argv)
     _ = MonitorWindow()
@@ -831,7 +803,4 @@ def start():
 
 
 if __name__ == "__main__":
-    config_log("DEBUG")
-    app = QApplication(sys.argv)
-    _ = MonitorWindow()
-    sys.exit(app.exec())
+    start()

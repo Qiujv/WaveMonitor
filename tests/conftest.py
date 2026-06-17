@@ -5,6 +5,7 @@ from PySide6.QtWidgets import QApplication
 
 os.environ.setdefault("QT_QPA_PLATFORM", "minimal")
 
+
 @pytest.fixture(scope="session")
 def qapp():
     app = QApplication.instance()
