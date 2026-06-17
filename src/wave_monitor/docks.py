@@ -36,6 +36,7 @@ class WaveformListDock(QDockWidget):
     hide_selected = Signal(list)
     remove_selected = Signal(list)
     clear_requested = Signal()
+    clear_saved_order_requested = Signal()
     separation_changed = Signal(float)
     interval_changed = Signal(float)
 
@@ -136,6 +137,12 @@ class WaveformListDock(QDockWidget):
         sort_action = QAction("Sort list", self)
         sort_action.triggered.connect(lambda checked=False: self.sort_items())
         menu.addAction(sort_action)
+
+        clear_saved_order_action = QAction("Clear saved order", self)
+        clear_saved_order_action.triggered.connect(
+            lambda checked=False: self.clear_saved_order_requested.emit()
+        )
+        menu.addAction(clear_saved_order_action)
 
         menu.exec(self.list_widget.mapToGlobal(pos))
 

@@ -105,3 +105,17 @@ def test_clear_saved_waveform_order(qapp, monkeypatch):
         assert settings.synced
     finally:
         monitor.window.close()
+
+
+def test_wfm_list_dock_can_clear_saved_waveform_order(qapp, monkeypatch):
+    settings = FakeSettings({WFM_ORDER_SETTINGS_KEY: ["a", "b"]})
+    monitor = create_monitor_with_settings(monkeypatch, settings)
+
+    try:
+        monitor.wfm_list_dock.clear_saved_order_requested.emit()
+
+        assert monitor._preferred_wfm_order == []
+        assert settings.values[WFM_ORDER_SETTINGS_KEY] == []
+        assert settings.synced
+    finally:
+        monitor.window.close()

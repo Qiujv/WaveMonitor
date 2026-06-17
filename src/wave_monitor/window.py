@@ -277,6 +277,7 @@ class MonitorWindow(QObject):
         wfm_list_dock.hide_selected.connect(self.hide_wfms)
         wfm_list_dock.remove_selected.connect(self.remove_wfms)
         wfm_list_dock.clear_requested.connect(self.confirm_clear)
+        wfm_list_dock.clear_saved_order_requested.connect(self.clear_saved_wfm_order)
         wfm_list_dock.separation_changed.connect(self._set_wfm_separation)
         wfm_list_dock.interval_changed.connect(
             lambda value: setattr(self.state, "wfm_interval", value)
@@ -489,15 +490,15 @@ class MonitorWindow(QObject):
         zoom_fit_action.triggered.connect(self.autoscale)
         menu.addAction(zoom_fit_action)
 
-        refresh_action = QAction("Refresh plots (R)", self.window)
+        refresh_action = QAction("Refresh (R)", self.window)
         refresh_action.triggered.connect(self.refresh_plots)
         menu.addAction(refresh_action)
 
-        dock_restore_action = QAction('Restore "wfms" list', self.window)
+        dock_restore_action = QAction('Show "wfms" dock', self.window)
         dock_restore_action.triggered.connect(self.restore_dock)
         menu.addAction(dock_restore_action)
 
-        log_restore_action = QAction('Restore "log" dock', self.window)
+        log_restore_action = QAction('Show "log" dock', self.window)
         log_restore_action.triggered.connect(self.restore_log_dock)
         menu.addAction(log_restore_action)
 
@@ -522,12 +523,7 @@ class MonitorWindow(QObject):
             f"/ {WFM_ORDER_CACHE_LIMIT:,}"
         )
         message.setStandardButtons(QMessageBox.Ok)
-        clear_button = message.addButton(
-            "Clear saved waveform order", QMessageBox.ActionRole
-        )
         message.exec()
-        if message.clickedButton() is clear_button:
-            self.clear_saved_wfm_order()
 
     @staticmethod
     def setup_app_style(app: QApplication) -> None:
